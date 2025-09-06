@@ -1,3 +1,6 @@
+# Note: If the target is categorical, wrap it as factor() so RFE runs classification. 
+# caret will then report Accuracy/Kappa instead of RMSE.
+
 # ============================
 # Block 2 — RFE (generalized)
 # ============================
