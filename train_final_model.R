@@ -1,5 +1,9 @@
+# Ensure target type matches task:
+#   • Regression → leave numeric (default)
+#   • Classification → wrap in factor(), e.g. train_y <- factor(target)
+
 # ============================
-# Block 3 — Train final model
+# Train final model
 # ============================
 
 suppressPackageStartupMessages({
