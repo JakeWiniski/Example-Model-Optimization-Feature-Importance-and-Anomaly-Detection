@@ -84,3 +84,23 @@ Local feature contribution plots for test set observations.
 - **Flexible**: Regression and classification supported, with or without PCA.  
 - **Explainable**: Combines global (VIP) and local (LIME) interpretability.  
 - **Practical**: Includes anomaly detection helpers for model monitoring.  
+
+## Workflow Diagram
+
+```mermaid
+flowchart TD
+    A[data_prep.R] --> B[feature_selection_rfe.R]
+    A --> C[pca_preprocessing.R]
+    C --> D[pca_rfe_feature_selection.R]
+
+    B --> E[model_training.R]
+    D --> E
+    E --> F[model_training_calibrated.R]
+
+    E --> G[run_anomaly_detection.R]
+    F --> H[anomaly_detection_calibrated.R]
+    E --> I[anomaly_detection_uncalibrated.R]
+    E --> J[run_anomaly_detection_classifier]
+    J --> K[anomaly_detection_classifier]
+
+    E --> L[lime_analysis.R]
