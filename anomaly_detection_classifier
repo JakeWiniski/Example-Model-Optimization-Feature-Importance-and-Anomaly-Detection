@@ -1,0 +1,190 @@
+# Anomaly detection helper for CLASSIFICATION targets
+detect_anomalies_from_classifier <- function(
+  model,
+  train_df,
+  test_df,
+  alpha = 0.05,           # conformal (1 - alpha) quantile on nonconformity
+  use_mad_rule = TRUE,    # optional MAD z rule on nonconformity
+  seed = 42,
+  verbose = TRUE,
+  # liberal-friendly knobs (same as regression helper)
+  q_scale = 1.00,         # multiply conformal threshold (e.g., 0.90–0.98 to flag more)
+  z_cut = 2.5,            # MAD z cutoff on nonconformity (smaller => more flags)
+  tail = c("upper")       # kept for API parity; nonconformity is one-sided (upper) only
+) {
+  tail <- match.arg(tail)
+  stopifnot(ncol(train_df) >= 3, ncol(test_df) >= 3)
+
+  # Pull RFE-selected feature names and (optional) factor level map from the model
+  sel_feats <- attr(model, "selected_features")
+  tr_levels <- attr(model, "factor_levels")
+  if (is.null(sel_feats)) stop("Model is missing 'selected_features' attribute. Attach it before saving.")
+
+  # Positional split: (run | features | target)
+  p_tr <- ncol(train_df); p_te <- ncol(test_df)
+  if (p_tr != p_te && verbose) message("Train/Test column counts differ; proceeding positionally.")
+  train_features_raw <- train_df[, 2:(p_tr - 1), drop = FALSE]
+  train_y            <- factor(train_df[[p_tr]])     # factor target (e.g., Outcome_stnd)
+  test_features_raw  <- test_df[,  2:(p_te - 1), drop = FALSE]
+  test_y             <- factor(test_df[[p_te]])
+
+  # Select only model features; ensure factors for character cols
+  train_X <- train_features_raw %>%
+    dplyr::select(all_of(sel_feats)) %>%
+    mutate(across(where(is.character), as.factor))
+  test_X  <- test_features_raw %>%
+    dplyr::select(all_of(sel_feats)) %>%
+    mutate(across(where(is.character), as.factor))
+
+  # If factor level map not stored on model, infer from training features
+  if (is.null(tr_levels)) {
+    tr_levels <- lapply(train_X, function(z) if (is.factor(z)) levels(z) else NULL)
+  }
+  # Align factor levels in test to training
+  for (nm in names(test_X)) {
+    if (!is.null(tr_levels[[nm]])) {
+      test_X[[nm]] <- factor(as.character(test_X[[nm]]), levels = tr_levels[[nm]])
+    }
+  }
+
+  # --- Calibration on training via CV (conformal threshold on nonconformity) ---
+  set.seed(seed)
+  calib_ctrl <- caret::trainControl(
+    method = "cv", number = 5, savePredictions = "final",
+    classProbs = TRUE, verboseIter = FALSE
+  )
+  calib_df <- data.frame(train_X, target = train_y)
+
+  calib_fit <- caret::train(
+    target ~ .,
+    data = calib_df,
+    method = model$method,                 # reuse learner (e.g., "ranger")
+    trControl = calib_ctrl,
+    tuneGrid  = model$bestTune %||% NULL,  # use winning tune if available
+    tuneLength = if (is.null(model$bestTune)) 1 else 1,
+    importance = "none"
+  )
+
+  # Keep only rows associated with the best tune (if tuning)
+  calib_pred <- calib_fit$pred
+  if (!is.null(calib_fit$bestTune)) {
+    for (nm in names(calib_fit$bestTune)) {
+      calib_pred <- calib_pred[calib_pred[[nm]] == calib_fit$bestTune[[nm]], , drop = FALSE]
+    }
+  }
+
+  # Compute nonconformity on calibration OOF preds: s = 1 - p(true class)
+  # Ensure class-prob columns exist and are ordered by training class levels
+  cls_levels <- levels(train_y)
+  for (mc in setdiff(cls_levels, colnames(calib_pred))) calib_pred[[mc]] <- 0
+  calib_pred <- calib_pred[, c("obs", cls_levels), drop = FALSE]
+
+  # Probability of the true class for each row (matrix indexing)
+  prob_true_calib <- calib_pred[cbind(seq_len(nrow(calib_pred)),
+                                      match(calib_pred$obs, cls_levels))]
+  nonconf_calib <- 1 - as.numeric(prob_true_calib)
+
+  # Conformal threshold (upper tail on nonconformity)
+  q_base <- as.numeric(stats::quantile(nonconf_calib, probs = 1 - alpha, na.rm = TRUE))
+  q_thr  <- q_scale * q_base
+
+  # Optional robust scale on nonconformity for MAD rule
+  sigma_hat <- NA_real_
+  if (use_mad_rule) {
+    mad_nc <- stats::mad(nonconf_calib, center = 0, constant = 1, na.rm = TRUE)
+    sigma_hat <- 1.4826 * mad_nc
+  }
+
+  # --- Score test set with the provided final model ---
+  # Predicted probabilities & classes
+  test_prob <- predict(model, newdata = test_X, type = "prob")
+  test_cls  <- predict(model, newdata = test_X, type = "raw")
+
+  # Ensure probability columns cover all training classes and are ordered
+  for (mc in setdiff(cls_levels, colnames(test_prob))) test_prob[[mc]] <- 0
+  test_prob <- test_prob[, cls_levels, drop = FALSE]
+
+  # Ensure factors for predicted vs observed share the same level set
+  lvl_union <- union(levels(test_y), levels(test_cls))
+  test_y  <- factor(test_y,  levels = lvl_union)
+  test_cls <- factor(test_cls, levels = lvl_union)
+
+  # Probability of the true class for each test row (use training class order)
+  test_y_cls <- factor(test_y, levels = cls_levels)
+  prob_true_test <- test_prob[cbind(seq_len(nrow(test_prob)),
+                                    match(test_y_cls, cls_levels))]
+  nonconf_test <- 1 - as.numeric(prob_true_test)
+
+  # Flags: conformal and (optional) MAD z rule
+  anomaly_conformal <- nonconf_test > q_thr
+  anomaly_3sigma <- if (use_mad_rule && is.finite(sigma_hat) && sigma_hat > 0) {
+    z <- nonconf_test / sigma_hat
+    z > z_cut
+  } else {
+    rep(FALSE, length(nonconf_test))
+  }
+  anomaly_flag <- anomaly_conformal | anomaly_3sigma
+
+  # Holdout classification metrics (safe comparison via characters)
+  acc <- mean(as.character(test_cls) == as.character(test_y), na.rm = TRUE)
+  cm  <- caret::confusionMatrix(
+    reference = factor(test_y,  levels = lvl_union),
+    data      = factor(test_cls, levels = lvl_union)
+  )
+
+  if (verbose) {
+    message(sprintf("Conformal nonconformity threshold: %.4f (alpha=%.2f, q_scale=%.2f)", q_thr, alpha, q_scale))
+    if (use_mad_rule && is.finite(sigma_hat))
+      message(sprintf("MAD sigma_hat (nonconformity): %.4f; z_cut: %.2f", sigma_hat, z_cut))
+    message(sprintf("Holdout Accuracy: %.3f | Kappa: %.3f",
+                    as.numeric(cm$overall["Accuracy"]), as.numeric(cm$overall["Kappa"])))
+  }
+
+  # Percentile rank of test nonconformity vs calib nonconformity
+  nc_percentile_rank <- vapply(nonconf_test, function(x) {
+    mean(nonconf_calib <= x, na.rm = TRUE)
+  }, numeric(1))
+
+  # Output table (use run from TEST set; fallback to row index)
+  out_tbl <- tibble::tibble(
+    run                      = test_df$run %||% seq_len(nrow(test_df)),
+    observed_class           = as.character(test_y),
+    predicted_class          = as.character(test_cls),
+    prob_true_class          = as.numeric(prob_true_test),
+    nonconformity            = as.numeric(nonconf_test),
+    nonconf_percentile_rank  = nc_percentile_rank,
+    anomaly_conformal        = anomaly_conformal,
+    anomaly_3sigma           = anomaly_3sigma,
+    anomaly_any              = anomaly_flag
+  )
+
+  # Plot: nonconformity with threshold
+  plt <- ggplot2::ggplot(out_tbl, ggplot2::aes(x = run, y = nonconformity)) +
+    ggplot2::geom_hline(yintercept = q_thr, linetype = "dashed") +
+    ggplot2::geom_point(ggplot2::aes(shape = anomaly_any), size = 3) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(
+      title = "Holdout Nonconformity (1 − p(true class)) with Threshold",
+      subtitle = paste0("nonconformity >", round(q_thr, 3),
+                        if (use_mad_rule && is.finite(sigma_hat) && sigma_hat > 0)
+                          paste0("  (z_cut=", z_cut, ", σ≈", round(sigma_hat, 3), ")")),
+      x = "run", y = "nonconformity"
+    ) +
+    ggplot2::theme_minimal()
+
+  list(
+    results_table   = out_tbl,
+    thresholds      = list(
+      conformal_nonconf = q_thr,
+      alpha = alpha,
+      q_scale = q_scale,
+      sigma_hat = sigma_hat,
+      z_cut = z_cut
+    ),
+    holdout_metrics = cm$overall,
+    plot            = plt
+  )
+}
+
+# Infix helper for defaults (same as your original)
+`%||%` <- function(x, y) if (is.null(x)) y else x
