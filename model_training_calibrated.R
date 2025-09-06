@@ -1,5 +1,9 @@
+# Ensure target type matches task:
+#   • Regression → leave numeric (default)
+#   • Classification → wrap in factor(), e.g. train_y <- factor(target)
+
 # ================================================================
-# Block 3 (PCA path) — Model training (ranger) + post-hoc calibration
+# Model training (ranger, PCA path) + post-hoc calibration
 # ================================================================
 
 suppressPackageStartupMessages({
