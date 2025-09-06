@@ -1,0 +1,27 @@
+# -------------------------------------------------------------------------
+# Anomaly Detection (Classifier) Settings:
+#   • Less liberal (stricter):
+#       alpha = 0.05   # 95% conformal interval (few anomalies)
+#       q_scale = 1.0  # no scaling of quantile threshold
+#       z_cut   = 3.0  # stricter MAD-based cutoff
+#
+#   • More liberal (looser):
+#       alpha = 0.15   # 85% conformal interval (more anomalies flagged)
+#       q_scale = 0.92 # shrink threshold slightly to increase flags
+#       z_cut   = 2.0  # looser MAD-based cutoff
+# -------------------------------------------------------------------------
+
+anom_cls <- detect_anomalies_from_classifier(
+  model        = final_model,   # generalized model name
+  train_df     = train_df,      # from generalized data prep
+  test_df      = test_df,
+  alpha        = 0.15,
+  q_scale      = 0.92,
+  z_cut        = 2.0,
+  use_mad_rule = TRUE
+)
+
+print(anom_cls$results_table)
+anom_cls$plot
+
+write.csv(anom_cls$results_table, "anomaly_results_classifier.csv", row.names = FALSE)
